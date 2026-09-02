@@ -1,5 +1,6 @@
 // AHD Matematik ve Kodlama Semineri — local multi-page demo.
-// AhdCode v0.4.0 has no cookies/sessions; login is one SQLite row on this machine.
+// AhdCode v0.5.0: users/messages stay in SQLite; login state is an in-memory
+// SessionStore. The browser cookie holds only an opaque session id.
 // Dynamic names and seminar text always go through HTML.text / HTML.element.
 
 bring Env
@@ -10,6 +11,8 @@ bring HTTP
 from HTTP bring Server
 from HTTP bring Request
 from HTTP bring Response
+from HTTP bring SessionStore
+from HTTP bring Session
 bring HTML
 from HTML bring HTMLNode
 bring SQLite
@@ -27,6 +30,12 @@ appTitle: String := Env.getOr("APP_TITLE", "AHD Matematik ve Kodlama Semineri")
 appHost: String := Env.getOr("APP_HOST", "127.0.0.1")
 appPort: Int := int(Env.getOr("APP_PORT", "8081"))
 dbPath: String := Env.getOr("DB_PATH", "data/seminer.db")
+sessions: SessionStore := HTTP.sessions(
+    "ahd_session"
+    3600
+    false
+    "Lax"
+)
 
 ensureDataDir: Function := () -> Nothing {
     dbPath: Global String
@@ -58,44 +67,31 @@ openDb: Function := () -> Database {
             body TEXT NOT NULL
         )
         """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS session (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER
-        )
-        """)
-    db.execute("INSERT OR IGNORE INTO session (id, user_id) VALUES (1, NULL)")
+    db.execute("DROP TABLE IF EXISTS session")
     return db
 }
 
-loggedName: Function := (db: Database) -> String? {
-    rows: Local List<Pair<String, SQLiteValue>> := db.query("""
-        SELECT users.name AS name
-        FROM session
-        JOIN users ON users.id = session.user_id
-        WHERE session.id = 1
-        """)
+loggedId: Function := (session: Session) -> Int? {
+    raw: Local String? := session.get("user_id")
+    if raw == null {
+        return null
+    }
+    return int(raw)
+}
+
+loggedName: Function := (db: Database, session: Session) -> String? {
+    userId: Local Int? := loggedId(session)
+    if userId == null {
+        return null
+    }
+    rows: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT name FROM users WHERE id = ?"
+        [SQLite.fromInt(userId)]
+    )
     if len(rows) == 0 {
         return null
     }
     return rows[0]["name"].string()
-}
-
-loggedId: Function := (db: Database) -> Int? {
-    rows: Local List<Pair<String, SQLiteValue>> := db.query("""
-        SELECT users.id AS id
-        FROM session
-        JOIN users ON users.id = session.user_id
-        WHERE session.id = 1
-        """)
-    if len(rows) == 0 {
-        return null
-    }
-    return rows[0]["id"].int()
-}
-
-setSession: Function := (db: Database, userId: SQLiteValue) -> Nothing {
-    db.execute("UPDATE session SET user_id = ? WHERE id = 1", [userId])
 }
 
 htmlPage: Function := (pageTitle: String, inner: HTMLNode, status: Int) -> Response {
@@ -320,7 +316,7 @@ siteFooter: Function := () -> HTMLNode {
                 "div"
                 {"class": "footer-inner"}
                 [
-                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.4.0 yerel demo")
+                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.5.0 yerel demo")
                 ]
             )
         ]
@@ -379,10 +375,10 @@ appChrome: Function := (userName: String?, content: HTMLNode) -> HTMLNode {
     )
 }
 
-noticePage: Function := (text: String, status: Int) -> Response {
+noticePage: Function := (session: Session, text: String, status: Int) -> Response {
     appTitle: Global String
     db: Local Database := openDb()
-    userName: Local String? := loggedName(db)
+    userName: Local String? := loggedName(db, session)
     db.close()
     content: Local HTMLNode := HTML.element(
         "main"
@@ -403,8 +399,10 @@ noticePage: Function := (text: String, status: Int) -> Response {
 
 home: Function := (request: Request) -> Response {
     appTitle: Global String
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     db: Local Database := openDb()
-    userName: Local String? := loggedName(db)
+    userName: Local String? := loggedName(db, session)
     people: Local List<Pair<String, SQLiteValue>> := db.query("""
         SELECT users.name AS name
         FROM messages
@@ -534,7 +532,7 @@ home: Function := (request: Request) -> Response {
     )
 
     page: Local HTMLNode := HTML.element("div", {}, [hero, body])
-    return htmlPage(appTitle, appChrome(userName, page), 200)
+    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, page), 200))
 }
 
 authForms: Function := (registerFirst: Bool) -> HTMLNode {
@@ -584,8 +582,10 @@ authForms: Function := (registerFirst: Bool) -> HTMLNode {
 
 registerPage: Function := (request: Request) -> Response {
     appTitle: Global String
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     db: Local Database := openDb()
-    userName: Local String? := loggedName(db)
+    userName: Local String? := loggedName(db, session)
     db.close()
     content: Local HTMLNode := HTML.element(
         "main"
@@ -603,13 +603,15 @@ registerPage: Function := (request: Request) -> Response {
             )
         ]
     )
-    return htmlPage(appTitle, appChrome(userName, content), 200)
+    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, content), 200))
 }
 
 loginPage: Function := (request: Request) -> Response {
     appTitle: Global String
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     db: Local Database := openDb()
-    userName: Local String? := loggedName(db)
+    userName: Local String? := loggedName(db, session)
     db.close()
     content: Local HTMLNode := HTML.element(
         "main"
@@ -626,21 +628,23 @@ loginPage: Function := (request: Request) -> Response {
             )
         ]
     )
-    return htmlPage(appTitle, appChrome(userName, content), 200)
+    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, content), 200))
 }
 
 panelPage: Function := (request: Request) -> Response {
     appTitle: Global String
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     db: Local Database := openDb()
-    userName: Local String? := loggedName(db)
-    userId: Local Int? := loggedId(db)
+    userName: Local String? := loggedName(db, session)
+    userId: Local Int? := loggedId(session)
     if userName == null {
         db.close()
-        return HTTP.redirect("/giris")
+        return sessions.commit(session, HTTP.redirect("/giris"))
     }
     if userId == null {
         db.close()
-        return HTTP.redirect("/giris")
+        return sessions.commit(session, HTTP.redirect("/giris"))
     }
     existing: Local List<Pair<String, SQLiteValue>> := db.query(
         "SELECT body FROM messages WHERE user_id = ?"
@@ -687,25 +691,27 @@ panelPage: Function := (request: Request) -> Response {
             )
         ]
     )
-    return htmlPage(appTitle, appChrome(userName, content), 200)
+    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, content), 200))
 }
 
 doRegister: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     nameValue: Local String? := request.form("name")
     passwordValue: Local String? := request.form("password")
     if nameValue == null {
-        return noticePage("Ad gerekli.", 400)
+        return sessions.commit(session, noticePage(session, "Ad gerekli.", 400))
     }
     if passwordValue == null {
-        return noticePage("Şifre gerekli.", 400)
+        return sessions.commit(session, noticePage(session, "Şifre gerekli.", 400))
     }
     nameText: Local String := nameValue.trim()
     passwordText: Local String := passwordValue.trim()
     if len(nameText) == 0 {
-        return noticePage("Ad boş olamaz.", 400)
+        return sessions.commit(session, noticePage(session, "Ad boş olamaz.", 400))
     }
     if len(passwordText) == 0 {
-        return noticePage("Şifre boş olamaz.", 400)
+        return sessions.commit(session, noticePage(session, "Şifre boş olamaz.", 400))
     }
 
     db: Local Database := openDb()
@@ -716,7 +722,7 @@ doRegister: Function := (request: Request) -> Response {
         )
     } except SQLiteError as error {
         db.close()
-        return noticePage("Bu ad zaten kayıtlı. Giriş yapmayı deneyin.", 400)
+        return sessions.commit(session, noticePage(session, "Bu ad zaten kayıtlı. Giriş yapmayı deneyin.", 400))
     }
     rows: Local List<Pair<String, SQLiteValue>> := db.query(
         "SELECT id FROM users WHERE name = ?"
@@ -724,21 +730,24 @@ doRegister: Function := (request: Request) -> Response {
     )
     if len(rows) == 0 {
         db.close()
-        return noticePage("Kayıt tamamlanamadı.", 400)
+        return sessions.commit(session, noticePage(session, "Kayıt tamamlanamadı.", 400))
     }
-    setSession(db, SQLite.fromInt(rows[0]["id"].int()))
     db.close()
-    return HTTP.redirect("/panel")
+    session.rotate()
+    session.set("user_id", str(rows[0]["id"].int()))
+    return sessions.commit(session, HTTP.redirect("/panel"))
 }
 
 doLogin: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     nameValue: Local String? := request.form("name")
     passwordValue: Local String? := request.form("password")
     if nameValue == null {
-        return noticePage("Ad gerekli.", 400)
+        return sessions.commit(session, noticePage(session, "Ad gerekli.", 400))
     }
     if passwordValue == null {
-        return noticePage("Şifre gerekli.", 400)
+        return sessions.commit(session, noticePage(session, "Şifre gerekli.", 400))
     }
     nameText: Local String := nameValue.trim()
     passwordText: Local String := passwordValue.trim()
@@ -749,32 +758,36 @@ doLogin: Function := (request: Request) -> Response {
     )
     if len(rows) == 0 {
         db.close()
-        return noticePage("Kayıt bulunamadı.", 400)
+        return sessions.commit(session, noticePage(session, "Kayıt bulunamadı.", 400))
     }
     if rows[0]["password"].string() != passwordText {
         db.close()
-        return noticePage("Şifre uyuşmuyor.", 400)
+        return sessions.commit(session, noticePage(session, "Şifre uyuşmuyor.", 400))
     }
-    setSession(db, SQLite.fromInt(rows[0]["id"].int()))
+    userId: Local Int := rows[0]["id"].int()
     db.close()
-    return HTTP.redirect("/panel")
+    session.rotate()
+    session.set("user_id", str(userId))
+    return sessions.commit(session, HTTP.redirect("/panel"))
 }
 
 sendText: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
     bodyValue: Local String? := request.form("body")
     if bodyValue == null {
-        return noticePage("Metin gerekli.", 400)
+        return sessions.commit(session, noticePage(session, "Metin gerekli.", 400))
     }
     bodyText: Local String := bodyValue.trim()
     if len(bodyText) == 0 {
-        return noticePage("Metin boş olamaz.", 400)
+        return sessions.commit(session, noticePage(session, "Metin boş olamaz.", 400))
     }
 
     db: Local Database := openDb()
-    userId: Local Int? := loggedId(db)
+    userId: Local Int? := loggedId(session)
     if userId == null {
         db.close()
-        return HTTP.redirect("/giris")
+        return sessions.commit(session, HTTP.redirect("/giris"))
     }
     existing: Local List<Pair<String, SQLiteValue>> := db.query(
         "SELECT id FROM messages WHERE user_id = ?"
@@ -782,21 +795,21 @@ sendText: Function := (request: Request) -> Response {
     )
     if len(existing) > 0 {
         db.close()
-        return noticePage("Metniniz zaten alınmıştı. Adınız seminer listesinde bir kez kalır.", 400)
+        return sessions.commit(session, noticePage(session, "Metniniz zaten alınmıştı. Adınız seminer listesinde bir kez kalır.", 400))
     }
     db.execute(
         "INSERT INTO messages (user_id, body) VALUES (?, ?)"
         [SQLite.fromInt(userId), SQLite.fromString(bodyText)]
     )
     db.close()
-    return HTTP.redirect("/")
+    return sessions.commit(session, HTTP.redirect("/"))
 }
 
 doLogout: Function := (request: Request) -> Response {
-    db: Local Database := openDb()
-    setSession(db, SQLite.nullValue())
-    db.close()
-    return HTTP.redirect("/")
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
+    session.destroy()
+    return sessions.commit(session, HTTP.redirect("/"))
 }
 
 app: Server := HTTP.server(appHost, appPort)
