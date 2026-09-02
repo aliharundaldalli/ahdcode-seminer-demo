@@ -1,0 +1,812 @@
+// AHD Matematik ve Kodlama Semineri — local multi-page demo.
+// AhdCode v0.4.0 has no cookies/sessions; login is one SQLite row on this machine.
+// Dynamic names and seminar text always go through HTML.text / HTML.element.
+
+bring Env
+from Env bring EnvError
+bring File
+bring Path
+bring HTTP
+from HTTP bring Server
+from HTTP bring Request
+from HTTP bring Response
+bring HTML
+from HTML bring HTMLNode
+bring SQLite
+from SQLite bring Database
+from SQLite bring SQLiteValue
+from SQLite bring SQLiteError
+
+attempt {
+    Env.load(".env")
+} except EnvError as error {
+    write("Uyarı: .env okunamadı ({error.message}). Varsayılan değerler kullanılacak.")
+}
+
+appTitle: String := Env.getOr("APP_TITLE", "AHD Matematik ve Kodlama Semineri")
+appHost: String := Env.getOr("APP_HOST", "127.0.0.1")
+appPort: Int := int(Env.getOr("APP_PORT", "8081"))
+dbPath: String := Env.getOr("DB_PATH", "data/seminer.db")
+
+ensureDataDir: Function := () -> Nothing {
+    dbPath: Global String
+    folder: Local String := Path.dir(dbPath)
+    if folder != "" {
+        if folder != "." {
+            if File.exists(folder) == false {
+                File.createDir(folder)
+            }
+        }
+    }
+}
+
+openDb: Function := () -> Database {
+    dbPath: Global String
+    ensureDataDir()
+    db: Local Database := SQLite.open(dbPath)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL
+        )
+        """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE,
+            body TEXT NOT NULL
+        )
+        """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS session (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER
+        )
+        """)
+    db.execute("INSERT OR IGNORE INTO session (id, user_id) VALUES (1, NULL)")
+    return db
+}
+
+loggedName: Function := (db: Database) -> String? {
+    rows: Local List<Pair<String, SQLiteValue>> := db.query("""
+        SELECT users.name AS name
+        FROM session
+        JOIN users ON users.id = session.user_id
+        WHERE session.id = 1
+        """)
+    if len(rows) == 0 {
+        return null
+    }
+    return rows[0]["name"].string()
+}
+
+loggedId: Function := (db: Database) -> Int? {
+    rows: Local List<Pair<String, SQLiteValue>> := db.query("""
+        SELECT users.id AS id
+        FROM session
+        JOIN users ON users.id = session.user_id
+        WHERE session.id = 1
+        """)
+    if len(rows) == 0 {
+        return null
+    }
+    return rows[0]["id"].int()
+}
+
+setSession: Function := (db: Database, userId: SQLiteValue) -> Nothing {
+    db.execute("UPDATE session SET user_id = ? WHERE id = 1", [userId])
+}
+
+htmlPage: Function := (pageTitle: String, inner: HTMLNode, status: Int) -> Response {
+    start: Local String := r"""<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>"""
+    middle: Local String := r"""</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@400;700&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --navy: #122033;
+    --navy-mid: #1a2f4a;
+    --gold: #c9b27a;
+    --gold-deep: #8a7348;
+    --paper: #f6f4f0;
+    --ink: #1c2430;
+    --muted: #5a6573;
+    --line: #d8d2c8;
+    --card: #fff;
+    --ok: #1e4d3a;
+    --err: #8b2e2e;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    color: var(--ink);
+    background:
+        radial-gradient(circle at top right, rgba(201, 178, 122, 0.18), transparent 36%),
+        var(--paper);
+    font-family: "Source Sans 3", "Segoe UI", sans-serif;
+    line-height: 1.6;
+}
+a { color: var(--navy-mid); }
+.topbar {
+    background: var(--navy);
+    color: #f3efe7;
+    border-bottom: 3px solid var(--gold);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+}
+.topbar-inner, .wrap, .footer-inner {
+    width: min(1080px, calc(100% - 2rem));
+    margin: 0 auto;
+}
+.topbar-inner {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    min-height: 72px;
+    flex-wrap: wrap;
+    padding: 0.6rem 0;
+}
+.brand {
+    color: #f3efe7;
+    text-decoration: none;
+}
+.brand strong {
+    display: block;
+    font-family: "Libre Baskerville", Georgia, serif;
+    font-size: 1.05rem;
+}
+.brand span {
+    display: block;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    opacity: 0.75;
+}
+.nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.85rem 1.1rem;
+    align-items: center;
+}
+.nav a, .nav button {
+    color: #e8e2d6;
+    background: none;
+    border: 0;
+    font: inherit;
+    cursor: pointer;
+    text-decoration: none;
+}
+.nav a:hover, .nav button:hover { color: #fff; }
+.hero {
+    background:
+        linear-gradient(180deg, rgba(18, 32, 51, 0.92), rgba(18, 32, 51, 0.82)),
+        linear-gradient(135deg, #1a2f4a 0%, #1e4d3a 100%);
+    color: #f7f3ec;
+    padding: 4.2rem 0 3.6rem;
+}
+.kicker {
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    font-size: 0.76rem;
+    color: var(--gold);
+    margin: 0 0 0.8rem;
+}
+.hero h1 {
+    font-family: "Libre Baskerville", Georgia, serif;
+    font-size: clamp(1.7rem, 4vw, 2.7rem);
+    line-height: 1.25;
+    margin: 0 0 0.8rem;
+    max-width: 16ch;
+}
+.hero p { max-width: 40rem; color: #e4ddd0; }
+.meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem 1.4rem;
+    margin: 1.4rem 0 1.8rem;
+}
+.actions { display: flex; flex-wrap: wrap; gap: 0.7rem; }
+.btn {
+    display: inline-block;
+    background: var(--gold);
+    color: var(--navy);
+    text-decoration: none;
+    border: 0;
+    padding: 0.75rem 1.2rem;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+}
+.btn.ghost {
+    background: transparent;
+    color: #f7f3ec;
+    outline: 1px solid rgba(247, 243, 236, 0.45);
+}
+.btn.navy {
+    background: var(--navy-mid);
+    color: #f7f3ec;
+}
+main { flex: 1; padding: 2.4rem 0 3rem; }
+h2, h3 { font-family: "Libre Baskerville", Georgia, serif; }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+}
+.card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    box-shadow: 0 8px 24px rgba(18, 32, 51, 0.06);
+    padding: 1.15rem 1.2rem;
+}
+.card .day {
+    color: var(--gold-deep);
+    font-size: 0.82rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 0 0 0.35rem;
+}
+.list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+.list li {
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--line);
+}
+form.stack label { display: block; margin: 0.85rem 0 0.3rem; font-weight: 600; }
+input, textarea {
+    width: 100%;
+    padding: 0.7rem 0.8rem;
+    border: 1px solid var(--line);
+    font: inherit;
+    background: #fff;
+}
+textarea { min-height: 140px; resize: vertical; }
+.notice {
+    background: #f8e7dc;
+    border: 1px solid #e2c4b0;
+    padding: 0.9rem 1rem;
+    margin-bottom: 1rem;
+}
+.ok {
+    background: #e8f0ec;
+    border: 1px solid #b7d0c2;
+    padding: 0.9rem 1rem;
+    margin-bottom: 1rem;
+}
+.split { display: grid; gap: 1.4rem; }
+@media (min-width: 860px) {
+    .split { grid-template-columns: 1.1fr 0.9fr; align-items: start; }
+}
+.muted { color: var(--muted); }
+footer {
+    background: var(--navy);
+    color: #eadccb;
+    padding: 1.1rem 0;
+    font-size: 0.92rem;
+}
+footer a { color: #f3e6d4; }
+</style>
+</head>
+<body>
+"""
+    ending: Local String := r"""
+</body>
+</html>"""
+    markup: Local String := start + HTML.render(HTML.text(pageTitle)) + middle + HTML.render(inner) + ending
+    return HTTP.html(markup, status)
+}
+
+siteFooter: Function := () -> HTMLNode {
+    return HTML.element(
+        "footer"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "footer-inner"}
+                [
+                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.4.0 yerel demo")
+                ]
+            )
+        ]
+    )
+}
+
+appChrome: Function := (userName: String?, content: HTMLNode) -> HTMLNode {
+    appTitle: Global String
+    links: Local List<HTMLNode> := [
+        HTML.element("a", {"href": "/"}, [HTML.text("Ana sayfa")])
+        HTML.element("a", {"href": "/kayit"}, [HTML.text("Kayıt ol")])
+    ]
+    if userName == null {
+        links.add(HTML.element("a", {"href": "/giris"}, [HTML.text("Giriş yap")]))
+    }
+    else {
+        links.add(HTML.element("a", {"href": "/panel"}, [HTML.text("Seminer metni")]))
+        links.add(
+            HTML.element(
+                "form"
+                {"method": "post", "action": "/cikis", "style": "margin:0"}
+                [
+                    HTML.element("button", {"type": "submit"}, [HTML.text("Çıkış")])
+                ]
+            )
+        )
+    }
+    return HTML.element(
+        "div"
+        {"style": "min-height:100vh;display:flex;flex-direction:column"}
+        [
+            HTML.element(
+                "header"
+                {"class": "topbar"}
+                [
+                    HTML.element(
+                        "div"
+                        {"class": "topbar-inner"}
+                        [
+                            HTML.element(
+                                "a"
+                                {"class": "brand", "href": "/"}
+                                [
+                                    HTML.element("strong", {}, [HTML.text(appTitle)])
+                                    HTML.element("span", {}, [HTML.text("Hatay 2026")])
+                                ]
+                            )
+                            HTML.element("nav", {"class": "nav"}, links)
+                        ]
+                    )
+                ]
+            )
+            content
+            siteFooter()
+        ]
+    )
+}
+
+noticePage: Function := (text: String, status: Int) -> Response {
+    appTitle: Global String
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db)
+    db.close()
+    content: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("div", {"class": "notice"}, [HTML.text(text)])
+                    HTML.element("a", {"href": "/"}, [HTML.text("Ana sayfaya dön")])
+                ]
+            )
+        ]
+    )
+    return htmlPage(appTitle, appChrome(userName, content), status)
+}
+
+home: Function := (request: Request) -> Response {
+    appTitle: Global String
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db)
+    people: Local List<Pair<String, SQLiteValue>> := db.query("""
+        SELECT users.name AS name
+        FROM messages
+        JOIN users ON users.id = messages.user_id
+        ORDER BY users.name
+        """)
+    db.close()
+
+    names: Local List<HTMLNode> := []
+    if len(people) == 0 {
+        names.add(HTML.element("p", {"class": "muted"}, [HTML.text("Henüz seminer listesine düşen isim yok.")]))
+    }
+    else {
+        items: Local List<HTMLNode> := []
+        for row in people {
+            items.add(HTML.element("li", {}, [HTML.text(row["name"].string())]))
+        }
+        names.add(HTML.element("ul", {"class": "list"}, items))
+    }
+
+    hero: Local HTMLNode := HTML.element(
+        "section"
+        {"class": "hero"}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("AHD Akademi")])
+                    HTML.element("h1", {}, [HTML.text(appTitle)])
+                    HTML.element(
+                        "p"
+                        {}
+                        [HTML.text("Hatay’da dört gün: matematik oturumları, kodlama atölyeleri ve yerel bir seminer defteri.")]
+                    )
+                    HTML.element(
+                        "div"
+                        {"class": "meta"}
+                        [
+                            HTML.element("span", {}, [HTML.text("27–30 Eylül 2026")])
+                            HTML.element("span", {}, [HTML.text("Hatay, Türkiye")])
+                            HTML.element("span", {}, [HTML.text("Mustafa Kemal Üniversitesi")])
+                        ]
+                    )
+                    HTML.element(
+                        "div"
+                        {"class": "actions"}
+                        [
+                            HTML.element("a", {"class": "btn", "href": "/kayit"}, [HTML.text("Kayıt ol")])
+                            HTML.element("a", {"class": "btn ghost", "href": "/giris"}, [HTML.text("Giriş yap")])
+                        ]
+                    )
+                ]
+            )
+        ]
+    )
+
+    body: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap split"}
+                [
+                    HTML.element(
+                        "section"
+                        {}
+                        [
+                            HTML.element("h2", {}, [HTML.text("Program")])
+                            HTML.element(
+                                "div"
+                                {"class": "grid"}
+                                [
+                                    HTML.element(
+                                        "article"
+                                        {"class": "card"}
+                                        [
+                                            HTML.element("p", {"class": "day"}, [HTML.text("27 Eylül Pazar")])
+                                            HTML.element("h3", {}, [HTML.text("Açılış")])
+                                            HTML.element("p", {}, [HTML.text("Hatay’da karşılama, seminer düzeni ve kodlama masalarının tanıtımı.")])
+                                        ]
+                                    )
+                                    HTML.element(
+                                        "article"
+                                        {"class": "card"}
+                                        [
+                                            HTML.element("p", {"class": "day"}, [HTML.text("28 Eylül Pazartesi")])
+                                            HTML.element("h3", {}, [HTML.text("Matematik")])
+                                            HTML.element("p", {}, [HTML.text("Sayılar, ispat ve sınıf içi problem çözme oturumları.")])
+                                        ]
+                                    )
+                                    HTML.element(
+                                        "article"
+                                        {"class": "card"}
+                                        [
+                                            HTML.element("p", {"class": "day"}, [HTML.text("29 Eylül Salı")])
+                                            HTML.element("h3", {}, [HTML.text("Kodlama")])
+                                            HTML.element("p", {}, [HTML.text("AhdCode ile küçük programlar; seminer defterine metin bırakma.")])
+                                        ]
+                                    )
+                                    HTML.element(
+                                        "article"
+                                        {"class": "card"}
+                                        [
+                                            HTML.element("p", {"class": "day"}, [HTML.text("30 Eylül Çarşamba")])
+                                            HTML.element("h3", {}, [HTML.text("Kapanış")])
+                                            HTML.element("p", {}, [HTML.text("Atölye özeti, listeye düşen isimler ve Hatay’dan veda.")])
+                                        ]
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+                    HTML.element(
+                        "section"
+                        {}
+                        [
+                            HTML.element("h2", {}, [HTML.text("Seminer listesi")])
+                            HTML.element("p", {"class": "muted"}, [HTML.text("Giriş yaptıktan sonra metin gönderen her isim burada bir kez görünür.")])
+                            HTML.element("div", {"class": "card"}, names)
+                        ]
+                    )
+                ]
+            )
+        ]
+    )
+
+    page: Local HTMLNode := HTML.element("div", {}, [hero, body])
+    return htmlPage(appTitle, appChrome(userName, page), 200)
+}
+
+authForms: Function := (registerFirst: Bool) -> HTMLNode {
+    registerCard: Local HTMLNode := HTML.element(
+        "section"
+        {"class": "card"}
+        [
+            HTML.element("h2", {}, [HTML.text("Kayıt ol")])
+            HTML.element("p", {"class": "muted"}, [HTML.text("Adınız seminer defterinde bir kez yer alır.")])
+            HTML.element(
+                "form"
+                {"class": "stack", "method": "post", "action": "/kayit"}
+                [
+                    HTML.element("label", {}, [HTML.text("Ad soyad")])
+                    HTML.element("input", {"type": "text", "name": "name", "required": "required"}, [])
+                    HTML.element("label", {}, [HTML.text("Şifre")])
+                    HTML.element("input", {"type": "password", "name": "password", "required": "required"}, [])
+                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Kayıt ol")])])
+                ]
+            )
+        ]
+    )
+    loginCard: Local HTMLNode := HTML.element(
+        "section"
+        {"class": "card"}
+        [
+            HTML.element("h2", {}, [HTML.text("Giriş yap")])
+            HTML.element("p", {"class": "muted"}, [HTML.text("Kayıtlıysanız seminer metnini göndermek için giriş yapın.")])
+            HTML.element(
+                "form"
+                {"class": "stack", "method": "post", "action": "/giris"}
+                [
+                    HTML.element("label", {}, [HTML.text("Ad soyad")])
+                    HTML.element("input", {"type": "text", "name": "name", "required": "required"}, [])
+                    HTML.element("label", {}, [HTML.text("Şifre")])
+                    HTML.element("input", {"type": "password", "name": "password", "required": "required"}, [])
+                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Giriş yap")])])
+                ]
+            )
+        ]
+    )
+    if registerFirst {
+        return HTML.element("div", {"class": "split"}, [registerCard, loginCard])
+    }
+    return HTML.element("div", {"class": "split"}, [loginCard, registerCard])
+}
+
+registerPage: Function := (request: Request) -> Response {
+    appTitle: Global String
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db)
+    db.close()
+    content: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Katılım")])
+                    HTML.element("h2", {}, [HTML.text("Kayıt ol")])
+                    HTML.element("p", {"class": "muted"}, [HTML.text("Önce kayıt, altta / yanda giriş. Hatay semineri 27–30 Eylül 2026.")])
+                    authForms(true)
+                ]
+            )
+        ]
+    )
+    return htmlPage(appTitle, appChrome(userName, content), 200)
+}
+
+loginPage: Function := (request: Request) -> Response {
+    appTitle: Global String
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db)
+    db.close()
+    content: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Katılım")])
+                    HTML.element("h2", {}, [HTML.text("Giriş yap")])
+                    authForms(false)
+                ]
+            )
+        ]
+    )
+    return htmlPage(appTitle, appChrome(userName, content), 200)
+}
+
+panelPage: Function := (request: Request) -> Response {
+    appTitle: Global String
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db)
+    userId: Local Int? := loggedId(db)
+    if userName == null {
+        db.close()
+        return HTTP.redirect("/giris")
+    }
+    if userId == null {
+        db.close()
+        return HTTP.redirect("/giris")
+    }
+    existing: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT body FROM messages WHERE user_id = ?"
+        [SQLite.fromInt(userId)]
+    )
+    db.close()
+
+    formOrNote: Local HTMLNode := HTML.element(
+        "form"
+        {"class": "stack", "method": "post", "action": "/metin"}
+        [
+            HTML.element("label", {}, [HTML.text("Seminer metniniz")])
+            HTML.element("textarea", {"name": "body", "required": "required"}, [])
+            HTML.element("p", {"class": "muted"}, [HTML.text("Gönderince adınız ana sayfadaki seminer listesine bir kez düşer.")])
+            HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Metni gönder")])])
+        ]
+    )
+    if len(existing) > 0 {
+        formOrNote = HTML.element(
+            "div"
+            {"class": "card"}
+            [
+                HTML.element("div", {"class": "ok"}, [HTML.text("Metniniz alındı. Adınız seminer listesinde bir kez görünür.")])
+                HTML.element("h3", {}, [HTML.text("Gönderdiğiniz metin")])
+                HTML.element("p", {}, [HTML.text(existing[0]["body"].string())])
+            ]
+        )
+    }
+
+    greeting: Local HTMLNode := HTML.element("p", {}, [HTML.text("Hoş geldiniz, "), HTML.text(userName), HTML.text(".")])
+    content: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Seminer defteri")])
+                    HTML.element("h2", {}, [HTML.text("Metin gönder")])
+                    greeting
+                    formOrNote
+                ]
+            )
+        ]
+    )
+    return htmlPage(appTitle, appChrome(userName, content), 200)
+}
+
+doRegister: Function := (request: Request) -> Response {
+    nameValue: Local String? := request.form("name")
+    passwordValue: Local String? := request.form("password")
+    if nameValue == null {
+        return noticePage("Ad gerekli.", 400)
+    }
+    if passwordValue == null {
+        return noticePage("Şifre gerekli.", 400)
+    }
+    nameText: Local String := nameValue.trim()
+    passwordText: Local String := passwordValue.trim()
+    if len(nameText) == 0 {
+        return noticePage("Ad boş olamaz.", 400)
+    }
+    if len(passwordText) == 0 {
+        return noticePage("Şifre boş olamaz.", 400)
+    }
+
+    db: Local Database := openDb()
+    attempt {
+        db.execute(
+            "INSERT INTO users (name, password) VALUES (?, ?)"
+            [SQLite.fromString(nameText), SQLite.fromString(passwordText)]
+        )
+    } except SQLiteError as error {
+        db.close()
+        return noticePage("Bu ad zaten kayıtlı. Giriş yapmayı deneyin.", 400)
+    }
+    rows: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT id FROM users WHERE name = ?"
+        [SQLite.fromString(nameText)]
+    )
+    if len(rows) == 0 {
+        db.close()
+        return noticePage("Kayıt tamamlanamadı.", 400)
+    }
+    setSession(db, SQLite.fromInt(rows[0]["id"].int()))
+    db.close()
+    return HTTP.redirect("/panel")
+}
+
+doLogin: Function := (request: Request) -> Response {
+    nameValue: Local String? := request.form("name")
+    passwordValue: Local String? := request.form("password")
+    if nameValue == null {
+        return noticePage("Ad gerekli.", 400)
+    }
+    if passwordValue == null {
+        return noticePage("Şifre gerekli.", 400)
+    }
+    nameText: Local String := nameValue.trim()
+    passwordText: Local String := passwordValue.trim()
+    db: Local Database := openDb()
+    rows: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT id, password FROM users WHERE name = ?"
+        [SQLite.fromString(nameText)]
+    )
+    if len(rows) == 0 {
+        db.close()
+        return noticePage("Kayıt bulunamadı.", 400)
+    }
+    if rows[0]["password"].string() != passwordText {
+        db.close()
+        return noticePage("Şifre uyuşmuyor.", 400)
+    }
+    setSession(db, SQLite.fromInt(rows[0]["id"].int()))
+    db.close()
+    return HTTP.redirect("/panel")
+}
+
+sendText: Function := (request: Request) -> Response {
+    bodyValue: Local String? := request.form("body")
+    if bodyValue == null {
+        return noticePage("Metin gerekli.", 400)
+    }
+    bodyText: Local String := bodyValue.trim()
+    if len(bodyText) == 0 {
+        return noticePage("Metin boş olamaz.", 400)
+    }
+
+    db: Local Database := openDb()
+    userId: Local Int? := loggedId(db)
+    if userId == null {
+        db.close()
+        return HTTP.redirect("/giris")
+    }
+    existing: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT id FROM messages WHERE user_id = ?"
+        [SQLite.fromInt(userId)]
+    )
+    if len(existing) > 0 {
+        db.close()
+        return noticePage("Metniniz zaten alınmıştı. Adınız seminer listesinde bir kez kalır.", 400)
+    }
+    db.execute(
+        "INSERT INTO messages (user_id, body) VALUES (?, ?)"
+        [SQLite.fromInt(userId), SQLite.fromString(bodyText)]
+    )
+    db.close()
+    return HTTP.redirect("/")
+}
+
+doLogout: Function := (request: Request) -> Response {
+    db: Local Database := openDb()
+    setSession(db, SQLite.nullValue())
+    db.close()
+    return HTTP.redirect("/")
+}
+
+app: Server := HTTP.server(appHost, appPort)
+app.get("/", home)
+app.get("/kayit", registerPage)
+app.get("/giris", loginPage)
+app.get("/panel", panelPage)
+app.post("/kayit", doRegister)
+app.post("/giris", doLogin)
+app.post("/metin", sendText)
+app.post("/cikis", doLogout)
+write("Seminer: http://{appHost}:{appPort}/")
+app.start()
