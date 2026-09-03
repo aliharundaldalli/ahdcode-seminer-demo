@@ -1,4 +1,5 @@
 app
+app.run
 data/
 .env
 .DS_Store

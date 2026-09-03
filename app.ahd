@@ -1,8 +1,6 @@
-// AHD Matematik ve Kodlama Semineri — local multi-page demo.
-// AhdCode v0.6.0: users/messages stay in SQLite; login state is an in-memory
-// SessionStore; the home page fetches Hatay weather over HTTPS with HTTP Client
-// and the existing JSON module. The browser cookie holds only an opaque session id.
-// Dynamic names, seminar text, and weather labels always go through HTML.text.
+// AHD Matematik ve Kodlama Semineri
+// AhdCode v0.10.0: Argon2id şifre, CSRF, SMTP ile şifre sıfırlama,
+// uzantısız saklanan PDF/metin özetlerinin HTTP.download ile indirilmesi.
 
 bring Env
 from Env bring EnvError
@@ -17,6 +15,7 @@ from HTTP bring Session
 from HTTP bring Client
 from HTTP bring ClientResponse
 from HTTP bring HTTPError
+from HTTP bring UploadedFile
 bring HTML
 from HTML bring HTMLNode
 bring JSON
@@ -26,9 +25,17 @@ bring SQLite
 from SQLite bring Database
 from SQLite bring SQLiteValue
 from SQLite bring SQLiteError
+bring Security
+from Security bring SecurityError
+bring Latex
+from Latex bring LatexError
+bring SMTP
+from SMTP bring SMTPClient
+from SMTP bring SMTPMessage
+from SMTP bring SMTPError
 
 attempt {
-    Env.load(".env")
+    Env.load(".env", true)
 } except EnvError as error {
     write("Uyarı: .env okunamadı ({error.message}). Varsayılan değerler kullanılacak.")
 }
@@ -37,10 +44,18 @@ appTitle: String := Env.getOr("APP_TITLE", "AHD Matematik ve Kodlama Semineri")
 appHost: String := Env.getOr("APP_HOST", "127.0.0.1")
 appPort: Int := int(Env.getOr("APP_PORT", "8081"))
 dbPath: String := Env.getOr("DB_PATH", "data/seminer.db")
+uploadDir: String := "data/ozetler"
+certDir: String := "data/sertifikalar"
 weatherUrl: String := Env.getOr(
     "WEATHER_URL"
     "https://api.open-meteo.com/v1/forecast?latitude=36.2026&longitude=36.1604&current=temperature_2m,weather_code&timezone=Europe/Istanbul"
 )
+smtpHost: String := Env.getOr("SMTP_HOST", "")
+smtpPort: Int := int(Env.getOr("SMTP_PORT", "587"))
+smtpSecurity: String := Env.getOr("SMTP_SECURITY", "starttls")
+smtpUsername: String := Env.getOr("SMTP_USERNAME", "")
+smtpPassword: String := Env.getOr("SMTP_PASSWORD", "")
+smtpFrom: String := Env.getOr("SMTP_FROM", "")
 httpClient: Client := HTTP.client(8)
 sessions: SessionStore := HTTP.sessions(
     "ahd_session"
@@ -49,9 +64,7 @@ sessions: SessionStore := HTTP.sessions(
     "Lax"
 )
 
-ensureDataDir: Function := () -> Nothing {
-    dbPath: Global String
-    folder: Local String := Path.dir(dbPath)
+ensureDir: Function := (folder: String) -> Nothing {
     if folder != "" {
         if folder != "." {
             if File.exists(folder) == false {
@@ -63,24 +76,75 @@ ensureDataDir: Function := () -> Nothing {
 
 openDb: Function := () -> Database {
     dbPath: Global String
-    ensureDataDir()
+    ensureDir(Path.dir(dbPath))
     db: Local Database := SQLite.open(dbPath)
+    attempt {
+        db.query("SELECT username, email, password_hash FROM users LIMIT 1")
+    } except SQLiteError as error {
+        db.execute("DROP TABLE IF EXISTS users")
+        db.execute("DROP TABLE IF EXISTS messages")
+    }
     db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL
+            username TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL
         )
         """)
     db.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
+        CREATE TABLE IF NOT EXISTS summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL UNIQUE,
-            body TEXT NOT NULL
+            title TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            download_name TEXT NOT NULL
+        )
+        """)
+    attempt {
+        db.query("SELECT token_hash FROM password_resets LIMIT 1")
+    } except SQLiteError as error {
+        db.execute("DROP TABLE IF EXISTS password_resets")
+    }
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS password_resets (
+            user_id INTEGER NOT NULL UNIQUE,
+            token_hash TEXT NOT NULL
         )
         """)
     db.execute("DROP TABLE IF EXISTS session")
     return db
+}
+
+csrfToken: Function := (session: Session) -> String {
+    token: Local String? := session.get("csrf")
+    if token == null {
+        token = Security.token()
+        session.set("csrf", token)
+    }
+    return token
+}
+
+csrfInput: Function := (session: Session) -> HTMLNode {
+    token: Local String := csrfToken(session)
+    return HTML.element("input", {"type": "hidden", "name": "csrf", "value": token}, [])
+}
+
+csrfOk: Function := (session: Session, request: Request) -> Bool {
+    expected: Local String? := session.get("csrf")
+    received: Local String? := request.form("csrf")
+    if expected == null {
+        return false
+    }
+    if received == null {
+        return false
+    }
+    return Security.secureEqual(expected, received)
+}
+
+rotateCsrf: Function := (session: Session) -> Nothing {
+    session.set("csrf", Security.token())
 }
 
 loggedId: Function := (session: Session) -> Int? {
@@ -97,13 +161,13 @@ loggedName: Function := (db: Database, session: Session) -> String? {
         return null
     }
     rows: Local List<Pair<String, SQLiteValue>> := db.query(
-        "SELECT name FROM users WHERE id = ?"
+        "SELECT username FROM users WHERE id = ?"
         [SQLite.fromInt(userId)]
     )
     if len(rows) == 0 {
         return null
     }
-    return rows[0]["name"].string()
+    return rows[0]["username"].string()
 }
 
 weatherLabel: Function := (code: Int) -> String {
@@ -405,29 +469,30 @@ siteFooter: Function := () -> HTMLNode {
                 "div"
                 {"class": "footer-inner"}
                 [
-                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.6.0 yerel demo")
+                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.10.0 yerel demo")
                 ]
             )
         ]
     )
 }
 
-appChrome: Function := (userName: String?, content: HTMLNode) -> HTMLNode {
+appChrome: Function := (session: Session, userName: String?, content: HTMLNode) -> HTMLNode {
     appTitle: Global String
     links: Local List<HTMLNode> := [
         HTML.element("a", {"href": "/"}, [HTML.text("Ana sayfa")])
-        HTML.element("a", {"href": "/kayit"}, [HTML.text("Kayıt ol")])
     ]
     if userName == null {
+        links.add(HTML.element("a", {"href": "/kayit"}, [HTML.text("Kayıt ol")]))
         links.add(HTML.element("a", {"href": "/giris"}, [HTML.text("Giriş yap")]))
     }
     else {
-        links.add(HTML.element("a", {"href": "/panel"}, [HTML.text("Seminer metni")]))
+        links.add(HTML.element("a", {"href": "/panel"}, [HTML.text("Panel")]))
         links.add(
             HTML.element(
                 "form"
                 {"method": "post", "action": "/cikis", "style": "margin:0"}
                 [
+                    csrfInput(session)
                     HTML.element("button", {"type": "submit"}, [HTML.text("Çıkış")])
                 ]
             )
@@ -483,7 +548,46 @@ noticePage: Function := (session: Session, text: String, status: Int) -> Respons
             )
         ]
     )
-    return htmlPage(appTitle, appChrome(userName, content), status)
+    return htmlPage(appTitle, appChrome(session, userName, content), status)
+}
+
+sendResetMail: Function := (toAddress: String, resetToken: String) -> String {
+    smtpHost: Global String
+    smtpPort: Global Int
+    smtpSecurity: Global String
+    smtpUsername: Global String
+    smtpPassword: Global String
+    smtpFrom: Global String
+    appHost: Global String
+    appPort: Global Int
+    if smtpHost == "" {
+        return "SMTP_HOST .env içinde boş. Posta gönderilmedi."
+    }
+    if smtpUsername == "" {
+        return "SMTP_USERNAME .env içinde boş. E-posta kullanıcı adınızı yazın."
+    }
+    if smtpPassword == "" {
+        return "SMTP_PASSWORD .env içinde boş. Gmail için uygulama şifresi yazın."
+    }
+    fromAddress: Local String := smtpUsername
+    if smtpFrom != "" {
+        fromAddress = smtpFrom
+    }
+    resetLink: Local String := "http://{appHost}:{str(appPort)}/sifre-sifirla?token={resetToken}"
+    attempt {
+        client: Local SMTPClient := SMTP.client(smtpHost, smtpPort, smtpSecurity)
+        client = client.withPlainAuth(smtpUsername, smtpPassword)
+        message: Local SMTPMessage := SMTP.message(
+            fromAddress
+            [toAddress]
+            "AHD Seminer şifre sıfırlama"
+        )
+        message = message.withText("Şifrenizi sıfırlamak için bu bağlantıyı açın: {resetLink}")
+        client.send(message)
+        return "ok"
+    } except SMTPError as error {
+        return error.message
+    }
 }
 
 home: Function := (request: Request) -> Response {
@@ -493,23 +597,46 @@ home: Function := (request: Request) -> Response {
     db: Local Database := openDb()
     userName: Local String? := loggedName(db, session)
     people: Local List<Pair<String, SQLiteValue>> := db.query("""
-        SELECT users.name AS name
-        FROM messages
-        JOIN users ON users.id = messages.user_id
-        ORDER BY users.name
+        SELECT summaries.id AS id, users.username AS username, summaries.title AS title
+        FROM summaries
+        JOIN users ON users.id = summaries.user_id
+        ORDER BY users.username
         """)
     db.close()
 
     names: Local List<HTMLNode> := []
     if len(people) == 0 {
-        names.add(HTML.element("p", {"class": "muted"}, [HTML.text("Henüz seminer listesine düşen isim yok.")]))
+        names.add(HTML.element("p", {"class": "muted"}, [HTML.text("Henüz indirilebilir özet yok.")]))
     }
     else {
         items: Local List<HTMLNode> := []
         for row in people {
-            items.add(HTML.element("li", {}, [HTML.text(row["name"].string())]))
+            itemId: Local String := str(row["id"].int())
+            items.add(
+                HTML.element(
+                    "li"
+                    {}
+                    [
+                        HTML.text(row["username"].string())
+                        HTML.text(" — ")
+                        HTML.text(row["title"].string())
+                        HTML.text(" · ")
+                        HTML.element("a", {"href": "/ozet?id={itemId}"}, [HTML.text("İndir")])
+                    ]
+                )
+            )
         }
         names.add(HTML.element("ul", {"class": "list"}, items))
+    }
+
+    heroButtons: Local List<HTMLNode> := [
+        HTML.element("a", {"class": "btn", "href": "/kayit"}, [HTML.text("Kayıt ol")])
+        HTML.element("a", {"class": "btn ghost", "href": "/giris"}, [HTML.text("Giriş yap")])
+    ]
+    if userName != null {
+        heroButtons = [
+            HTML.element("a", {"class": "btn", "href": "/panel"}, [HTML.text("Panele git")])
+        ]
     }
 
     hero: Local HTMLNode := HTML.element(
@@ -536,14 +663,7 @@ home: Function := (request: Request) -> Response {
                             HTML.element("span", {}, [HTML.text("Mustafa Kemal Üniversitesi")])
                         ]
                     )
-                    HTML.element(
-                        "div"
-                        {"class": "actions"}
-                        [
-                            HTML.element("a", {"class": "btn", "href": "/kayit"}, [HTML.text("Kayıt ol")])
-                            HTML.element("a", {"class": "btn ghost", "href": "/giris"}, [HTML.text("Giriş yap")])
-                        ]
-                    )
+                    HTML.element("div", {"class": "actions"}, heroButtons)
                 ]
             )
         ]
@@ -590,7 +710,7 @@ home: Function := (request: Request) -> Response {
                                         [
                                             HTML.element("p", {"class": "day"}, [HTML.text("29 Eylül Salı")])
                                             HTML.element("h3", {}, [HTML.text("Kodlama")])
-                                            HTML.element("p", {}, [HTML.text("AhdCode ile küçük programlar; seminer defterine metin bırakma.")])
+                                            HTML.element("p", {}, [HTML.text("AhdCode ile küçük programlar; panele özet bırakma.")])
                                         ]
                                     )
                                     HTML.element(
@@ -613,8 +733,8 @@ home: Function := (request: Request) -> Response {
                             HTML.element("h2", {}, [HTML.text("Hatay hava")])
                             HTML.element("p", {"class": "muted"}, [HTML.text("Ana sayfa her açılışta HTTPS ile Open-Meteo’dan güncel sıcaklığı alır.")])
                             weatherCard()
-                            HTML.element("h2", {}, [HTML.text("Seminer listesi")])
-                            HTML.element("p", {"class": "muted"}, [HTML.text("Giriş yaptıktan sonra metin gönderen her isim burada bir kez görünür.")])
+                            HTML.element("h2", {}, [HTML.text("Özet listesi")])
+                            HTML.element("p", {"class": "muted"}, [HTML.text("Giriş yaptıktan sonra özet gönderen her kullanıcı adı burada bir kez görünür. Özetler indirilebilir.")])
                             HTML.element("div", {"class": "card"}, names)
                         ]
                     )
@@ -624,52 +744,7 @@ home: Function := (request: Request) -> Response {
     )
 
     page: Local HTMLNode := HTML.element("div", {}, [hero, body])
-    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, page), 200))
-}
-
-authForms: Function := (registerFirst: Bool) -> HTMLNode {
-    registerCard: Local HTMLNode := HTML.element(
-        "section"
-        {"class": "card"}
-        [
-            HTML.element("h2", {}, [HTML.text("Kayıt ol")])
-            HTML.element("p", {"class": "muted"}, [HTML.text("Adınız seminer defterinde bir kez yer alır.")])
-            HTML.element(
-                "form"
-                {"class": "stack", "method": "post", "action": "/kayit"}
-                [
-                    HTML.element("label", {}, [HTML.text("Ad soyad")])
-                    HTML.element("input", {"type": "text", "name": "name", "required": "required"}, [])
-                    HTML.element("label", {}, [HTML.text("Şifre")])
-                    HTML.element("input", {"type": "password", "name": "password", "required": "required"}, [])
-                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Kayıt ol")])])
-                ]
-            )
-        ]
-    )
-    loginCard: Local HTMLNode := HTML.element(
-        "section"
-        {"class": "card"}
-        [
-            HTML.element("h2", {}, [HTML.text("Giriş yap")])
-            HTML.element("p", {"class": "muted"}, [HTML.text("Kayıtlıysanız seminer metnini göndermek için giriş yapın.")])
-            HTML.element(
-                "form"
-                {"class": "stack", "method": "post", "action": "/giris"}
-                [
-                    HTML.element("label", {}, [HTML.text("Ad soyad")])
-                    HTML.element("input", {"type": "text", "name": "name", "required": "required"}, [])
-                    HTML.element("label", {}, [HTML.text("Şifre")])
-                    HTML.element("input", {"type": "password", "name": "password", "required": "required"}, [])
-                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Giriş yap")])])
-                ]
-            )
-        ]
-    )
-    if registerFirst {
-        return HTML.element("div", {"class": "split"}, [registerCard, loginCard])
-    }
-    return HTML.element("div", {"class": "split"}, [loginCard, registerCard])
+    return sessions.commit(session, htmlPage(appTitle, appChrome(session, userName, page), 200))
 }
 
 registerPage: Function := (request: Request) -> Response {
@@ -679,6 +754,9 @@ registerPage: Function := (request: Request) -> Response {
     db: Local Database := openDb()
     userName: Local String? := loggedName(db, session)
     db.close()
+    if userName != null {
+        return sessions.commit(session, HTTP.redirect("/panel"))
+    }
     content: Local HTMLNode := HTML.element(
         "main"
         {}
@@ -689,16 +767,87 @@ registerPage: Function := (request: Request) -> Response {
                 [
                     HTML.element("p", {"class": "kicker"}, [HTML.text("Katılım")])
                     HTML.element("h2", {}, [HTML.text("Kayıt ol")])
-                    HTML.element("p", {"class": "muted"}, [HTML.text("Önce kayıt, altta / yanda giriş. Hatay semineri 27–30 Eylül 2026.")])
-                    authForms(true)
+                    HTML.element("p", {"class": "muted"}, [HTML.text("Kullanıcı adı ve şifre ile kayıt olun. Giriş ayrı sayfadadır.")])
+                    HTML.element(
+                        "section"
+                        {"class": "card"}
+                        [
+                            HTML.element(
+                                "form"
+                                {"class": "stack", "method": "post", "action": "/kayit"}
+                                [
+                                    csrfInput(session)
+                                    HTML.element("label", {}, [HTML.text("Kullanıcı adı")])
+                                    HTML.element("input", {"type": "text", "name": "username", "required": "required", "autocomplete": "username"}, [])
+                                    HTML.element("label", {}, [HTML.text("E-posta")])
+                                    HTML.element("input", {"type": "email", "name": "email", "required": "required", "autocomplete": "email"}, [])
+                                    HTML.element("label", {}, [HTML.text("Şifre")])
+                                    HTML.element("input", {"type": "password", "name": "password", "required": "required", "autocomplete": "new-password"}, [])
+                                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Kayıt ol")])])
+                                ]
+                            )
+                        ]
+                    )
+                    HTML.element("p", {"class": "muted"}, [HTML.element("a", {"href": "/giris"}, [HTML.text("Zaten kayıtlıysanız giriş yapın")])])
                 ]
             )
         ]
     )
-    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, content), 200))
+    return sessions.commit(session, htmlPage(appTitle, appChrome(session, userName, content), 200))
 }
 
 loginPage: Function := (request: Request) -> Response {
+    appTitle: Global String
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db, session)
+    db.close()
+    if userName != null {
+        return sessions.commit(session, HTTP.redirect("/panel"))
+    }
+    content: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Katılım")])
+                    HTML.element("h2", {}, [HTML.text("Giriş yap")])
+                    HTML.element("p", {"class": "muted"}, [HTML.text("Kayıt bu sayfada yoktur. Şifrenizi unuttuysanız sıfırlama bağlantısı isteyin.")])
+                    HTML.element(
+                        "section"
+                        {"class": "card"}
+                        [
+                            HTML.element(
+                                "form"
+                                {"class": "stack", "method": "post", "action": "/giris"}
+                                [
+                                    csrfInput(session)
+                                    HTML.element("label", {}, [HTML.text("Kullanıcı adı")])
+                                    HTML.element("input", {"type": "text", "name": "username", "required": "required", "autocomplete": "username"}, [])
+                                    HTML.element("label", {}, [HTML.text("Şifre")])
+                                    HTML.element("input", {"type": "password", "name": "password", "required": "required", "autocomplete": "current-password"}, [])
+                                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Giriş yap")])])
+                                ]
+                            )
+                        ]
+                    )
+                    HTML.element("p", {"class": "muted"}, [
+                        HTML.element("a", {"href": "/kayit"}, [HTML.text("Kayıt ol")])
+                        HTML.text(" · ")
+                        HTML.element("a", {"href": "/sifre-unuttum"}, [HTML.text("Şifremi unuttum")])
+                    ])
+                ]
+            )
+        ]
+    )
+    return sessions.commit(session, htmlPage(appTitle, appChrome(session, userName, content), 200))
+}
+
+forgotPage: Function := (request: Request) -> Response {
     appTitle: Global String
     sessions: Global SessionStore
     session: Local Session := sessions.open(request)
@@ -713,14 +862,75 @@ loginPage: Function := (request: Request) -> Response {
                 "div"
                 {"class": "wrap"}
                 [
-                    HTML.element("p", {"class": "kicker"}, [HTML.text("Katılım")])
-                    HTML.element("h2", {}, [HTML.text("Giriş yap")])
-                    authForms(false)
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Hesap")])
+                    HTML.element("h2", {}, [HTML.text("Şifremi unuttum")])
+                    HTML.element("p", {"class": "muted"}, [HTML.text("Kullanıcı adı veya e-posta yazın. Kayıtlı bir hesap varsa bağlantı gönderilir; hangi adresin kayıtlı olduğunu söylemeyiz.")])
+                    HTML.element(
+                        "section"
+                        {"class": "card"}
+                        [
+                            HTML.element(
+                                "form"
+                                {"class": "stack", "method": "post", "action": "/sifre-unuttum"}
+                                [
+                                    csrfInput(session)
+                                    HTML.element("label", {}, [HTML.text("Kullanıcı adı veya e-posta")])
+                                    HTML.element("input", {"type": "text", "name": "account", "required": "required"}, [])
+                                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Sıfırlama bağlantısı gönder")])])
+                                ]
+                            )
+                        ]
+                    )
                 ]
             )
         ]
     )
-    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, content), 200))
+    return sessions.commit(session, htmlPage(appTitle, appChrome(session, userName, content), 200))
+}
+
+resetPage: Function := (request: Request) -> Response {
+    appTitle: Global String
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db, session)
+    db.close()
+    resetToken: Local String? := request.query("token")
+    if resetToken == null {
+        return sessions.commit(session, noticePage(session, "Sıfırlama bağlantısı eksik.", 400))
+    }
+    content: Local HTMLNode := HTML.element(
+        "main"
+        {}
+        [
+            HTML.element(
+                "div"
+                {"class": "wrap"}
+                [
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Hesap")])
+                    HTML.element("h2", {}, [HTML.text("Yeni şifre")])
+                    HTML.element(
+                        "section"
+                        {"class": "card"}
+                        [
+                            HTML.element(
+                                "form"
+                                {"class": "stack", "method": "post", "action": "/sifre-sifirla"}
+                                [
+                                    csrfInput(session)
+                                    HTML.element("input", {"type": "hidden", "name": "token", "value": resetToken}, [])
+                                    HTML.element("label", {}, [HTML.text("Yeni şifre")])
+                                    HTML.element("input", {"type": "password", "name": "password", "required": "required", "autocomplete": "new-password"}, [])
+                                    HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Şifreyi güncelle")])])
+                                ]
+                            )
+                        ]
+                    )
+                ]
+            )
+        ]
+    )
+    return sessions.commit(session, htmlPage(appTitle, appChrome(session, userName, content), 200))
 }
 
 panelPage: Function := (request: Request) -> Response {
@@ -739,29 +949,42 @@ panelPage: Function := (request: Request) -> Response {
         return sessions.commit(session, HTTP.redirect("/giris"))
     }
     existing: Local List<Pair<String, SQLiteValue>> := db.query(
-        "SELECT body FROM messages WHERE user_id = ?"
+        "SELECT id, title, download_name FROM summaries WHERE user_id = ?"
         [SQLite.fromInt(userId)]
     )
     db.close()
 
     formOrNote: Local HTMLNode := HTML.element(
         "form"
-        {"class": "stack", "method": "post", "action": "/metin"}
+        {
+            "class": "stack"
+            "method": "post"
+            "action": "/ozet"
+            "enctype": "multipart/form-data"
+        }
         [
-            HTML.element("label", {}, [HTML.text("Seminer metniniz")])
-            HTML.element("textarea", {"name": "body", "required": "required"}, [])
-            HTML.element("p", {"class": "muted"}, [HTML.text("Gönderince adınız ana sayfadaki seminer listesine bir kez düşer.")])
-            HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Metni gönder")])])
+            csrfInput(session)
+            HTML.element("label", {}, [HTML.text("Özet adı")])
+            HTML.element("input", {"type": "text", "name": "title", "required": "required"}, [])
+            HTML.element("label", {}, [HTML.text("Özet metni (yazarak)")])
+            HTML.element("textarea", {"name": "body"}, [])
+            HTML.element("label", {}, [HTML.text("veya PDF yükle")])
+            HTML.element("input", {"type": "file", "name": "paper", "accept": "application/pdf,.pdf"}, [])
+            HTML.element("p", {"class": "muted"}, [HTML.text("Yüklenen PDF diskte uzantısız saklanır; indirme adı sizin verdiğiniz özet adı + .pdf olur.")])
+            HTML.element("p", {}, [HTML.element("button", {"class": "btn navy", "type": "submit"}, [HTML.text("Özeti kaydet")])])
         ]
     )
     if len(existing) > 0 {
+        summaryId: Local String := str(existing[0]["id"].int())
         formOrNote = HTML.element(
             "div"
             {"class": "card"}
             [
-                HTML.element("div", {"class": "ok"}, [HTML.text("Metniniz alındı. Adınız seminer listesinde bir kez görünür.")])
-                HTML.element("h3", {}, [HTML.text("Gönderdiğiniz metin")])
-                HTML.element("p", {}, [HTML.text(existing[0]["body"].string())])
+                HTML.element("div", {"class": "ok"}, [HTML.text("Özetiniz alındı. Adınız listede bir kez görünür.")])
+                HTML.element("h3", {}, [HTML.text(existing[0]["title"].string())])
+                HTML.element("p", {}, [
+                    HTML.element("a", {"href": "/ozet?id={summaryId}"}, [HTML.text("İndir: " + existing[0]["download_name"].string())])
+                ])
             ]
         )
     }
@@ -775,50 +998,72 @@ panelPage: Function := (request: Request) -> Response {
                 "div"
                 {"class": "wrap"}
                 [
-                    HTML.element("p", {"class": "kicker"}, [HTML.text("Seminer defteri")])
-                    HTML.element("h2", {}, [HTML.text("Metin gönder")])
+                    HTML.element("p", {"class": "kicker"}, [HTML.text("Seminer paneli")])
+                    HTML.element("h2", {}, [HTML.text("Panel")])
                     greeting
+                    HTML.element(
+                        "div"
+                        {"class": "card"}
+                        [
+                            HTML.element("h3", {}, [HTML.text("Katılma sertifikası")])
+                            HTML.element("p", {"class": "muted"}, [HTML.text("Sertifika LaTeX ile PDF olarak üretilir. Adınız belgede yer alır.")])
+                            HTML.element("p", {}, [HTML.element("a", {"class": "btn navy", "href": "/sertifika"}, [HTML.text("Sertifikayı indir")])])
+                        ]
+                    )
+                    HTML.element("h2", {}, [HTML.text("Özet")])
                     formOrNote
                 ]
             )
         ]
     )
-    return sessions.commit(session, htmlPage(appTitle, appChrome(userName, content), 200))
+    return sessions.commit(session, htmlPage(appTitle, appChrome(session, userName, content), 200))
 }
 
 doRegister: Function := (request: Request) -> Response {
     sessions: Global SessionStore
     session: Local Session := sessions.open(request)
-    nameValue: Local String? := request.form("name")
+    if csrfOk(session, request) == false {
+        return sessions.commit(session, noticePage(session, "CSRF doğrulaması başarısız.", 403))
+    }
+    usernameValue: Local String? := request.form("username")
+    emailValue: Local String? := request.form("email")
     passwordValue: Local String? := request.form("password")
-    if nameValue == null {
-        return sessions.commit(session, noticePage(session, "Ad gerekli.", 400))
+    if usernameValue == null {
+        return sessions.commit(session, noticePage(session, "Kullanıcı adı gerekli.", 400))
+    }
+    if emailValue == null {
+        return sessions.commit(session, noticePage(session, "E-posta gerekli.", 400))
     }
     if passwordValue == null {
         return sessions.commit(session, noticePage(session, "Şifre gerekli.", 400))
     }
-    nameText: Local String := nameValue.trim()
-    passwordText: Local String := passwordValue.trim()
-    if len(nameText) == 0 {
-        return sessions.commit(session, noticePage(session, "Ad boş olamaz.", 400))
+    usernameText: Local String := usernameValue.trim()
+    emailText: Local String := emailValue.trim()
+    passwordText: Local String := passwordValue
+    if len(usernameText) == 0 {
+        return sessions.commit(session, noticePage(session, "Kullanıcı adı boş olamaz.", 400))
+    }
+    if len(emailText) == 0 {
+        return sessions.commit(session, noticePage(session, "E-posta boş olamaz.", 400))
     }
     if len(passwordText) == 0 {
         return sessions.commit(session, noticePage(session, "Şifre boş olamaz.", 400))
     }
 
+    encodedHash: Local String := Security.passwordHash(passwordText)
     db: Local Database := openDb()
     attempt {
         db.execute(
-            "INSERT INTO users (name, password) VALUES (?, ?)"
-            [SQLite.fromString(nameText), SQLite.fromString(passwordText)]
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)"
+            [SQLite.fromString(usernameText), SQLite.fromString(emailText), SQLite.fromString(encodedHash)]
         )
     } except SQLiteError as error {
         db.close()
-        return sessions.commit(session, noticePage(session, "Bu ad zaten kayıtlı. Giriş yapmayı deneyin.", 400))
+        return sessions.commit(session, noticePage(session, "Bu kullanıcı adı veya e-posta zaten kayıtlı. Giriş yapmayı deneyin.", 400))
     }
     rows: Local List<Pair<String, SQLiteValue>> := db.query(
-        "SELECT id FROM users WHERE name = ?"
-        [SQLite.fromString(nameText)]
+        "SELECT id FROM users WHERE username = ?"
+        [SQLite.fromString(usernameText)]
     )
     if len(rows) == 0 {
         db.close()
@@ -827,52 +1072,163 @@ doRegister: Function := (request: Request) -> Response {
     db.close()
     session.rotate()
     session.set("user_id", str(rows[0]["id"].int()))
+    rotateCsrf(session)
     return sessions.commit(session, HTTP.redirect("/panel"))
 }
 
 doLogin: Function := (request: Request) -> Response {
     sessions: Global SessionStore
     session: Local Session := sessions.open(request)
-    nameValue: Local String? := request.form("name")
+    if csrfOk(session, request) == false {
+        return sessions.commit(session, noticePage(session, "CSRF doğrulaması başarısız.", 403))
+    }
+    usernameValue: Local String? := request.form("username")
     passwordValue: Local String? := request.form("password")
-    if nameValue == null {
-        return sessions.commit(session, noticePage(session, "Ad gerekli.", 400))
+    if usernameValue == null {
+        return sessions.commit(session, noticePage(session, "Kullanıcı adı gerekli.", 400))
     }
     if passwordValue == null {
         return sessions.commit(session, noticePage(session, "Şifre gerekli.", 400))
     }
-    nameText: Local String := nameValue.trim()
-    passwordText: Local String := passwordValue.trim()
+    usernameText: Local String := usernameValue.trim()
+    passwordText: Local String := passwordValue
     db: Local Database := openDb()
     rows: Local List<Pair<String, SQLiteValue>> := db.query(
-        "SELECT id, password FROM users WHERE name = ?"
-        [SQLite.fromString(nameText)]
+        "SELECT id, password_hash FROM users WHERE username = ?"
+        [SQLite.fromString(usernameText)]
     )
     if len(rows) == 0 {
         db.close()
         return sessions.commit(session, noticePage(session, "Kayıt bulunamadı.", 400))
     }
-    if rows[0]["password"].string() != passwordText {
-        db.close()
-        return sessions.commit(session, noticePage(session, "Şifre uyuşmuyor.", 400))
-    }
+    storedHash: Local String := rows[0]["password_hash"].string()
     userId: Local Int := rows[0]["id"].int()
+    attempt {
+        ok: Local Bool := Security.passwordVerify(passwordText, storedHash)
+        if ok == false {
+            db.close()
+            return sessions.commit(session, noticePage(session, "Şifre uyuşmuyor.", 400))
+        }
+    } except SecurityError as error {
+        db.close()
+        return sessions.commit(session, noticePage(session, "Kayıtlı şifre hash'i bozuk.", 400))
+    }
     db.close()
     session.rotate()
     session.set("user_id", str(userId))
+    rotateCsrf(session)
     return sessions.commit(session, HTTP.redirect("/panel"))
 }
 
-sendText: Function := (request: Request) -> Response {
+doForgot: Function := (request: Request) -> Response {
     sessions: Global SessionStore
     session: Local Session := sessions.open(request)
-    bodyValue: Local String? := request.form("body")
-    if bodyValue == null {
-        return sessions.commit(session, noticePage(session, "Metin gerekli.", 400))
+    if csrfOk(session, request) == false {
+        return sessions.commit(session, noticePage(session, "CSRF doğrulaması başarısız.", 403))
     }
-    bodyText: Local String := bodyValue.trim()
-    if len(bodyText) == 0 {
-        return sessions.commit(session, noticePage(session, "Metin boş olamaz.", 400))
+    accountValue: Local String? := request.form("account")
+    if accountValue == null {
+        return sessions.commit(session, noticePage(session, "Kullanıcı adı veya e-posta gerekli.", 400))
+    }
+    accountText: Local String := accountValue.trim()
+    if len(accountText) == 0 {
+        return sessions.commit(session, noticePage(session, "Kullanıcı adı veya e-posta boş olamaz.", 400))
+    }
+    db: Local Database := openDb()
+    rows: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT id, email FROM users WHERE username = ? OR email = ?"
+        [SQLite.fromString(accountText), SQLite.fromString(accountText)]
+    )
+    if len(rows) > 0 {
+        userId: Local Int := rows[0]["id"].int()
+        emailText: Local String := rows[0]["email"].string()
+        resetToken: Local String := Security.token()
+        tokenHash: Local String := Security.passwordHash(resetToken)
+        db.execute("DELETE FROM password_resets WHERE user_id = ?", [SQLite.fromInt(userId)])
+        db.execute(
+            "INSERT INTO password_resets (user_id, token_hash) VALUES (?, ?)"
+            [SQLite.fromInt(userId), SQLite.fromString(tokenHash)]
+        )
+        mailResult: Local String := sendResetMail(emailText, resetToken)
+        if mailResult != "ok" {
+            write("SMTP sıfırlama postası gönderilemedi: " + mailResult)
+        }
+    }
+    db.close()
+    rotateCsrf(session)
+    return sessions.commit(session, noticePage(session, "Bu kullanıcı adı veya e-posta kayıtlıysa sıfırlama bağlantısı gönderildi.", 200))
+}
+
+doReset: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
+    if csrfOk(session, request) == false {
+        return sessions.commit(session, noticePage(session, "CSRF doğrulaması başarısız.", 403))
+    }
+    tokenValue: Local String? := request.form("token")
+    passwordValue: Local String? := request.form("password")
+    if tokenValue == null {
+        return sessions.commit(session, noticePage(session, "Sıfırlama bağlantısı eksik.", 400))
+    }
+    if passwordValue == null {
+        return sessions.commit(session, noticePage(session, "Şifre gerekli.", 400))
+    }
+    passwordText: Local String := passwordValue
+    candidateToken: Local String := tokenValue
+    if len(passwordText) == 0 {
+        return sessions.commit(session, noticePage(session, "Şifre boş olamaz.", 400))
+    }
+    db: Local Database := openDb()
+    rows: Local List<Pair<String, SQLiteValue>> := db.query("SELECT user_id, token_hash FROM password_resets")
+    matchedId: Local Int := 0
+    found: Local Bool := false
+    for row in rows {
+        storedHash: Local String := row["token_hash"].string()
+        attempt {
+            ok: Local Bool := Security.passwordVerify(candidateToken, storedHash)
+            if ok == true {
+                matchedId = row["user_id"].int()
+                found = true
+            }
+        } except SecurityError as error {
+            found = found
+        }
+    }
+    if found == false {
+        db.close()
+        return sessions.commit(session, noticePage(session, "Sıfırlama bağlantısı geçersiz.", 400))
+    }
+    encodedHash: Local String := Security.passwordHash(passwordText)
+    db.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?"
+        [SQLite.fromString(encodedHash), SQLite.fromInt(matchedId)]
+    )
+    db.execute("DELETE FROM password_resets WHERE user_id = ?", [SQLite.fromInt(matchedId)])
+    db.close()
+    rotateCsrf(session)
+    return sessions.commit(session, noticePage(session, "Şifreniz güncellendi. Giriş yapabilirsiniz.", 200))
+}
+
+saveSummary: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    uploadDir: Global String
+    session: Local Session := sessions.open(request)
+    if csrfOk(session, request) == false {
+        return sessions.commit(session, noticePage(session, "CSRF doğrulaması başarısız.", 403))
+    }
+    titleValue: Local String? := request.form("title")
+    bodyValue: Local String? := request.form("body")
+    paper: Local UploadedFile? := request.file("paper")
+    if titleValue == null {
+        return sessions.commit(session, noticePage(session, "Özet adı gerekli.", 400))
+    }
+    titleText: Local String := titleValue.trim()
+    if len(titleText) == 0 {
+        return sessions.commit(session, noticePage(session, "Özet adı boş olamaz.", 400))
+    }
+    bodyText: Local String := ""
+    if bodyValue != null {
+        bodyText = bodyValue.trim()
     }
 
     db: Local Database := openDb()
@@ -882,36 +1238,136 @@ sendText: Function := (request: Request) -> Response {
         return sessions.commit(session, HTTP.redirect("/giris"))
     }
     existing: Local List<Pair<String, SQLiteValue>> := db.query(
-        "SELECT id FROM messages WHERE user_id = ?"
+        "SELECT id FROM summaries WHERE user_id = ?"
         [SQLite.fromInt(userId)]
     )
     if len(existing) > 0 {
         db.close()
-        return sessions.commit(session, noticePage(session, "Metniniz zaten alınmıştı. Adınız seminer listesinde bir kez kalır.", 400))
+        return sessions.commit(session, noticePage(session, "Özetiniz zaten alınmıştı.", 400))
     }
+
+    storedPath: Local String := ""
+    contentType: Local String := ""
+    downloadName: Local String := ""
+    if paper != null {
+        if paper.detectedContentType() != "application/pdf" {
+            db.close()
+            return sessions.commit(session, noticePage(session, "Yalnızca PDF kabul edilir.", 415))
+        }
+        ensureDir(uploadDir)
+        storedPath = paper.save(uploadDir)
+        contentType = "application/pdf"
+        downloadName = titleText + ".pdf"
+    }
+    else {
+        if len(bodyText) == 0 {
+            db.close()
+            return sessions.commit(session, noticePage(session, "Özet metni yazın veya PDF yükleyin.", 400))
+        }
+        ensureDir(uploadDir)
+        storedPath = Path.join([uploadDir, Security.token()])
+        File.writeText(storedPath, bodyText)
+        contentType = "text/plain; charset=utf-8"
+        downloadName = titleText + ".txt"
+    }
+
     db.execute(
-        "INSERT INTO messages (user_id, body) VALUES (?, ?)"
-        [SQLite.fromInt(userId), SQLite.fromString(bodyText)]
+        "INSERT INTO summaries (user_id, title, stored_path, content_type, download_name) VALUES (?, ?, ?, ?, ?)"
+        [
+            SQLite.fromInt(userId)
+            SQLite.fromString(titleText)
+            SQLite.fromString(storedPath)
+            SQLite.fromString(contentType)
+            SQLite.fromString(downloadName)
+        ]
     )
     db.close()
+    rotateCsrf(session)
     return sessions.commit(session, HTTP.redirect("/"))
+}
+
+downloadSummary: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    session: Local Session := sessions.open(request)
+    idText: Local String? := request.query("id")
+    if idText == null {
+        return sessions.commit(session, noticePage(session, "Özet numarası gerekli.", 400))
+    }
+    db: Local Database := openDb()
+    rows: Local List<Pair<String, SQLiteValue>> := db.query(
+        "SELECT stored_path, content_type, download_name FROM summaries WHERE id = ?"
+        [SQLite.fromInt(int(idText))]
+    )
+    db.close()
+    if len(rows) == 0 {
+        return sessions.commit(session, noticePage(session, "Özet bulunamadı.", 404))
+    }
+    storedPath: Local String := rows[0]["stored_path"].string()
+    contentType: Local String := rows[0]["content_type"].string()
+    downloadName: Local String := rows[0]["download_name"].string()
+    return sessions.commit(session, HTTP.download(storedPath, contentType, downloadName))
 }
 
 doLogout: Function := (request: Request) -> Response {
     sessions: Global SessionStore
     session: Local Session := sessions.open(request)
+    if csrfOk(session, request) == false {
+        return sessions.commit(session, noticePage(session, "CSRF doğrulaması başarısız.", 403))
+    }
     session.destroy()
     return sessions.commit(session, HTTP.redirect("/"))
 }
 
-app: Server := HTTP.server(appHost, appPort)
+downloadCertificate: Function := (request: Request) -> Response {
+    sessions: Global SessionStore
+    certDir: Global String
+    session: Local Session := sessions.open(request)
+    db: Local Database := openDb()
+    userName: Local String? := loggedName(db, session)
+    db.close()
+    if userName == null {
+        return sessions.commit(session, HTTP.redirect("/giris"))
+    }
+    escapedName: Local String := Latex.escape(userName)
+    body: Local String := Latex.center("AHD Akademi · Hatay 2026")
+    body += Latex.section("Katılma Sertifikası")
+    body += "Bu belge, " + escapedName + " adlı katılımcının 27--30 Eylül 2026 tarihlerinde Hatay'da düzenlenen AHD Matematik ve Kodlama Semineri'ne katıldığını belgeler.\n"
+    body += Latex.section("Düzenleyen")
+    body += "Mustafa Kemal Üniversitesi · AHD Akademi\n"
+    source: Local String := Latex.document(
+        body: body
+        title: "Katılma Sertifikası"
+        author: escapedName
+        date: "27-30 Eylül 2026"
+        type: "Article"
+        margin: 2.5
+        color: "#122033"
+    )
+    ensureDir(certDir)
+    storedPath: Local String := Path.join([certDir, Security.token() + ".pdf"])
+    attempt {
+        Latex.pdf(source, storedPath)
+    } except LatexError as error {
+        return sessions.commit(session, noticePage(session, "Sertifika üretilemedi: " + error.message, 500))
+    }
+    downloadName: Local String := userName + " - Katilma Sertifikasi.pdf"
+    return sessions.commit(session, HTTP.download(storedPath, "application/pdf", downloadName))
+}
+
+app: Server := HTTP.server(appHost, appPort, 26214400)
 app.get("/", home)
 app.get("/kayit", registerPage)
 app.get("/giris", loginPage)
 app.get("/panel", panelPage)
+app.get("/sifre-unuttum", forgotPage)
+app.get("/sifre-sifirla", resetPage)
+app.get("/ozet", downloadSummary)
+app.get("/sertifika", downloadCertificate)
 app.post("/kayit", doRegister)
 app.post("/giris", doLogin)
-app.post("/metin", sendText)
 app.post("/cikis", doLogout)
-write("Seminer: http://{appHost}:{appPort}/")
+app.post("/ozet", saveSummary)
+app.post("/sifre-unuttum", doForgot)
+app.post("/sifre-sifirla", doReset)
+write("Seminer: http://{appHost}:{str(appPort)}/")
 app.start()
