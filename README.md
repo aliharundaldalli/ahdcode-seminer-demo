@@ -1,30 +1,33 @@
 # AHD Matematik ve Kodlama Semineri
 
-Bu uygulama [AhdCode](https://github.com/aliharundaldalli/AhdCode) **v0.5.0**
+Bu uygulama [AhdCode](https://github.com/aliharundaldalli/AhdCode) **v0.6.0**
 ile yazılmış ayrı bir demo deposudur.
 
 Hatay’da **27–30 Eylül 2026** için çok sayfalı yerel seminer defteri:
-ana sayfa, kayıt, giriş ve seminer metni.
+ana sayfa, kayıt, giriş, seminer metni ve Open-Meteo hava kartı.
 
-HTTP, HTML, Cookie, SessionStore, SQLite ve Env kullanır. Apache, MAMP veya
-nginx gerekmez.
+HTTP sunucu, HTTP Client, HTML, Cookie, SessionStore, SQLite, JSON ve Env
+kullanır. Apache, MAMP veya nginx gerekmez. Hava için API anahtarı yoktur.
 
-Bu depo **v0.2.0** sürümüdür. v0.1.0 tek SQLite oturum satırı kullanıyordu;
+Bu depo **v0.3.0** sürümüdür. v0.1.0 tek SQLite oturum satırı kullanıyordu;
 v0.2.0, AhdCode v0.5.0 Web State ile tarayıcı başına bellek içi oturum ekler.
+v0.3.0, AhdCode v0.6.0 HTTP Client ile ana sayfada Hatay havasını çeker.
 
 ## Gereksinimler
 
-- Kurulu **AhdCode v0.5.0** (`ahdcode --version`)
+- Kurulu **AhdCode v0.6.0** (`ahdcode --version`)
 - SQLite yardımcısı **`ahdsqlite`** (HTTP, çerez ve oturum için yardımcı process yok)
 - Tarayıcı (yazı tipleri Google Fonts CDN’den yüklenir)
+- Ana sayfa hava kartı için çıkan HTTPS (Open-Meteo)
 
 ## Ne gösterir?
 
 - Birden fazla kesin HTTP yolu (`/`, `/kayit`, `/giris`, `/panel`)
 - `Env.load(".env")` ile başlık / host / port
+- Ana sayfada `HTTP.client` + `JSON.parse` ile Antakya sıcaklığı
 - Kayıt ve giriş; seminer metni bir kez
 - Ana sayfadaki listede her ad **bir kez**
-- Kullanıcı metnini `HTML.text` / `HTML.element` ile güvenli basmak
+- Kullanıcı metnini ve API metnini `HTML.text` / `HTML.element` ile güvenli basmak
 - Tarayıcı başına bellek içi oturum: çerezde yalnızca opak bir id,
   `user_id` sunucuda `SessionStore` içinde
 
@@ -54,6 +57,7 @@ AhdCode `.env` dosyasını kendiliğinden okumaz. Program `Env.load(".env")` ça
 | `APP_HOST` | Adres | `127.0.0.1` |
 | `APP_PORT` | Port | `8081` |
 | `DB_PATH` | SQLite dosyası | `data/seminer.db` |
+| `WEATHER_URL` | Hava API adresi (isteğe bağlı) | Open-Meteo Hatay tahmini |
 
 ```bash
 cp .env.example .env

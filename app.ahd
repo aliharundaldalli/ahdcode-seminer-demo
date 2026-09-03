@@ -1,7 +1,8 @@
 // AHD Matematik ve Kodlama Semineri — local multi-page demo.
-// AhdCode v0.5.0: users/messages stay in SQLite; login state is an in-memory
-// SessionStore. The browser cookie holds only an opaque session id.
-// Dynamic names and seminar text always go through HTML.text / HTML.element.
+// AhdCode v0.6.0: users/messages stay in SQLite; login state is an in-memory
+// SessionStore; the home page fetches Hatay weather over HTTPS with HTTP Client
+// and the existing JSON module. The browser cookie holds only an opaque session id.
+// Dynamic names, seminar text, and weather labels always go through HTML.text.
 
 bring Env
 from Env bring EnvError
@@ -13,8 +14,14 @@ from HTTP bring Request
 from HTTP bring Response
 from HTTP bring SessionStore
 from HTTP bring Session
+from HTTP bring Client
+from HTTP bring ClientResponse
+from HTTP bring HTTPError
 bring HTML
 from HTML bring HTMLNode
+bring JSON
+from JSON bring JSONValue
+from JSON bring JSONError
 bring SQLite
 from SQLite bring Database
 from SQLite bring SQLiteValue
@@ -30,6 +37,11 @@ appTitle: String := Env.getOr("APP_TITLE", "AHD Matematik ve Kodlama Semineri")
 appHost: String := Env.getOr("APP_HOST", "127.0.0.1")
 appPort: Int := int(Env.getOr("APP_PORT", "8081"))
 dbPath: String := Env.getOr("DB_PATH", "data/seminer.db")
+weatherUrl: String := Env.getOr(
+    "WEATHER_URL"
+    "https://api.open-meteo.com/v1/forecast?latitude=36.2026&longitude=36.1604&current=temperature_2m,weather_code&timezone=Europe/Istanbul"
+)
+httpClient: Client := HTTP.client(8)
 sessions: SessionStore := HTTP.sessions(
     "ahd_session"
     3600
@@ -92,6 +104,83 @@ loggedName: Function := (db: Database, session: Session) -> String? {
         return null
     }
     return rows[0]["name"].string()
+}
+
+weatherLabel: Function := (code: Int) -> String {
+    if code == 0 {
+        return "açık"
+    }
+    if code <= 3 {
+        return "parçalı bulutlu"
+    }
+    if code <= 48 {
+        return "sisli"
+    }
+    if code <= 67 {
+        return "yağmurlu"
+    }
+    if code <= 77 {
+        return "karlı"
+    }
+    if code <= 82 {
+        return "sağanak"
+    }
+    if code <= 99 {
+        return "gök gürültülü"
+    }
+    return "değişken"
+}
+
+weatherUnavailable: Function := (detail: String) -> HTMLNode {
+    return HTML.element(
+        "article"
+        {"class": "card"}
+        [
+            HTML.element("p", {"class": "day"}, [HTML.text("Hatay hava")])
+            HTML.element("h3", {}, [HTML.text("Şu an alınamadı")])
+            HTML.element("p", {"class": "muted"}, [HTML.text(detail)])
+        ]
+    )
+}
+
+weatherCard: Function := () -> HTMLNode {
+    httpClient: Global Client
+    weatherUrl: Global String
+    attempt {
+        response: Local ClientResponse := httpClient.get(weatherUrl)
+        if response.status() >= 400 {
+            return weatherUnavailable("API durumu {str(response.status())}")
+        }
+        parsed: Local JSONValue := JSON.parse(response.body())
+        current: Local JSONValue? := parsed.get("current")
+        if current == null {
+            return weatherUnavailable("Yanıtta current yok")
+        }
+        tempVal: Local JSONValue? := current.get("temperature_2m")
+        codeVal: Local JSONValue? := current.get("weather_code")
+        if tempVal == null {
+            return weatherUnavailable("Sıcaklık yok")
+        }
+        if codeVal == null {
+            return weatherUnavailable("Kod yok")
+        }
+        temp: Local String := str(tempVal.real())
+        label: Local String := weatherLabel(codeVal.int())
+        return HTML.element(
+            "article"
+            {"class": "card"}
+            [
+                HTML.element("p", {"class": "day"}, [HTML.text("Hatay hava")])
+                HTML.element("h3", {}, [HTML.text("{temp} °C")])
+                HTML.element("p", {}, [HTML.text("Antakya · {label}")])
+                HTML.element("p", {"class": "muted"}, [HTML.text("Open-Meteo · HTTP Client")])
+            ]
+        )
+    } except HTTPError as error {
+        return weatherUnavailable(error.message)
+    } except JSONError as error {
+        return weatherUnavailable(error.message)
+    }
 }
 
 htmlPage: Function := (pageTitle: String, inner: HTMLNode, status: Int) -> Response {
@@ -316,7 +405,7 @@ siteFooter: Function := () -> HTMLNode {
                 "div"
                 {"class": "footer-inner"}
                 [
-                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.5.0 yerel demo")
+                    HTML.text("Hatay · 27–30 Eylül 2026 · AhdCode v0.6.0 yerel demo")
                 ]
             )
         ]
@@ -521,6 +610,9 @@ home: Function := (request: Request) -> Response {
                         "section"
                         {}
                         [
+                            HTML.element("h2", {}, [HTML.text("Hatay hava")])
+                            HTML.element("p", {"class": "muted"}, [HTML.text("Ana sayfa her açılışta HTTPS ile Open-Meteo’dan güncel sıcaklığı alır.")])
+                            weatherCard()
                             HTML.element("h2", {}, [HTML.text("Seminer listesi")])
                             HTML.element("p", {"class": "muted"}, [HTML.text("Giriş yaptıktan sonra metin gönderen her isim burada bir kez görünür.")])
                             HTML.element("div", {"class": "card"}, names)
